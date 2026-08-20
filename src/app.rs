@@ -27,16 +27,22 @@ pub struct AppModel {
     popup: Option<Id>,
     config: Config,
     config_handler: Option<cosmic_config::Config>,
-    inhibit_conn: Option<zbus::blocking::Connection>,
-    inhibit_cookie: Option<u32>,
+    /// Session-bus inhibit that keeps the screen on (`org.freedesktop.ScreenSaver`).
+    screensaver_conn: Option<zbus::blocking::Connection>,
+    screensaver_cookie: Option<u32>,
+    /// System-bus inhibit that keeps the machine up (`org.freedesktop.login1`),
+    /// held open as a file descriptor, alongside the `what` string it was
+    /// taken with so a changed setting can re-acquire.
+    logind_fd: Option<zbus::zvariant::OwnedFd>,
+    logind_what: Option<String>,
 }
 
 impl Drop for AppModel {
     fn drop(&mut self) {
-        // Release only this instance's inhibit. Deliberately does not touch the
-        // shared config: one panel instance exiting must not turn Vigil off on
-        // the others.
-        self.release_inhibit();
+        // Release only this instance's inhibits. Deliberately does not touch
+        // the shared config: one panel instance exiting must not turn Vigil off
+        // on the others.
+        self.release_all();
     }
 }
 
@@ -49,6 +55,8 @@ pub enum Message {
     Tick,
     PopupClosed(Id),
     UpdateConfig(Config),
+    SetAllowScreenOff(bool),
+    SetAwakeWithLidClosed(bool),
 }
 
 impl AppModel {
@@ -73,8 +81,8 @@ impl AppModel {
     /// Every instance holds its own inhibit. `cosmic-idle` keeps inhibitors in
     /// a list and only lets the screen sleep once all of them are gone, so the
     /// duplication is harmless and avoids electing a single owner process.
-    fn acquire_inhibit(&mut self) -> bool {
-        if self.inhibit_cookie.is_some() {
+    fn acquire_screensaver(&mut self) -> bool {
+        if self.screensaver_cookie.is_some() {
             return true;
         }
 
@@ -97,8 +105,8 @@ impl AppModel {
         match reply {
             Ok(msg) => match msg.body().deserialize::<u32>() {
                 Ok(cookie) => {
-                    self.inhibit_conn = Some(conn);
-                    self.inhibit_cookie = Some(cookie);
+                    self.screensaver_conn = Some(conn);
+                    self.screensaver_cookie = Some(cookie);
                     true
                 }
                 Err(e) => {
@@ -113,9 +121,11 @@ impl AppModel {
         }
     }
 
-    /// Drop this instance's inhibit. Does not touch config.
-    fn release_inhibit(&mut self) {
-        if let (Some(conn), Some(cookie)) = (self.inhibit_conn.take(), self.inhibit_cookie.take()) {
+    /// Drop this instance's screensaver inhibit. Does not touch config.
+    fn release_screensaver(&mut self) {
+        if let (Some(conn), Some(cookie)) =
+            (self.screensaver_conn.take(), self.screensaver_cookie.take())
+        {
             let _ = conn.call_method(
                 Some("org.freedesktop.ScreenSaver"),
                 "/org/freedesktop/ScreenSaver",
@@ -126,24 +136,118 @@ impl AppModel {
         }
     }
 
-    /// Bring this instance's inhibit in line with the shared flag.
+    /// The logind inhibit this instance should be holding, if any.
     ///
-    /// Used when another monitor's instance toggled Vigil. Never writes config,
-    /// which is what stops two instances from echoing updates back and forth.
-    fn sync_inhibit(&mut self) {
-        if self.config.active {
-            self.acquire_inhibit();
-        } else {
-            self.release_inhibit();
+    /// `None` means no logind inhibit is wanted, which is the case whenever
+    /// Vigil is off or is only being asked to keep the screen on.
+    fn wanted_logind_what(&self) -> Option<String> {
+        if !self.config.active {
+            return None;
         }
+        let mut what = Vec::new();
+        if self.config.allow_screen_off {
+            what.push("sleep");
+        }
+        if self.config.awake_with_lid_closed {
+            what.push("handle-lid-switch");
+        }
+        (!what.is_empty()).then(|| what.join(":"))
+    }
+
+    /// Take a logind block inhibit. Does not touch config.
+    ///
+    /// Unlike the ScreenSaver cookie this is a file descriptor: logind holds
+    /// the inhibit for exactly as long as the fd is open, so dropping it — or
+    /// the process dying for any reason — releases it without a round trip.
+    fn acquire_logind(&mut self, what: &str) -> bool {
+        let conn = match zbus::blocking::Connection::system() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("failed to connect to system bus: {e}");
+                return false;
+            }
+        };
+
+        let reply = conn.call_method(
+            Some("org.freedesktop.login1"),
+            "/org/freedesktop/login1",
+            Some("org.freedesktop.login1.Manager"),
+            "Inhibit",
+            &(
+                what,
+                "Vigil",
+                "User requested the system stay awake",
+                "block",
+            ),
+        );
+
+        match reply {
+            Ok(msg) => match msg.body().deserialize::<zbus::zvariant::OwnedFd>() {
+                Ok(fd) => {
+                    self.logind_fd = Some(fd);
+                    self.logind_what = Some(what.to_owned());
+                    true
+                }
+                Err(e) => {
+                    eprintln!("failed to parse logind Inhibit reply: {e}");
+                    false
+                }
+            },
+            Err(e) => {
+                eprintln!("failed to call login1.Inhibit({what}): {e}");
+                false
+            }
+        }
+    }
+
+    /// Drop this instance's logind inhibit by closing the fd.
+    fn release_logind(&mut self) {
+        self.logind_fd = None;
+        self.logind_what = None;
+    }
+
+    /// Is this instance currently holding anything at all?
+    fn is_inhibiting(&self) -> bool {
+        self.screensaver_cookie.is_some() || self.logind_fd.is_some()
+    }
+
+    /// Bring the inhibits this instance holds in line with the shared config.
+    ///
+    /// Used when another monitor's instance toggled Vigil, and after any local
+    /// change. Never writes config, which is what stops two instances from
+    /// echoing updates back and forth.
+    fn apply_inhibits(&mut self) {
+        // Keeping the screen on and keeping the system up are separate
+        // mechanisms: cosmic-idle's ScreenSaver inhibit suppresses screen-off
+        // and suspend together, so "screen may sleep" has to go through logind.
+        if self.config.active && !self.config.allow_screen_off {
+            self.acquire_screensaver();
+        } else {
+            self.release_screensaver();
+        }
+
+        let wanted = self.wanted_logind_what();
+        if self.logind_what != wanted {
+            // The inhibit is immutable once taken, so a changed `what` string
+            // means dropping the old fd and asking for a new one.
+            self.release_logind();
+            if let Some(what) = wanted {
+                self.acquire_logind(&what);
+            }
+        }
+    }
+
+    /// Release everything this instance holds, without touching config.
+    fn release_all(&mut self) {
+        self.release_screensaver();
+        self.release_logind();
     }
 
     /// Turn Vigil on in response to a user action, and publish that to the
     /// other instances.
     fn activate(&mut self, duration_mins: u32) {
-        if !self.acquire_inhibit() {
-            return;
-        }
+        let previous = self.config.clone();
+
         self.config.duration_mins = duration_mins;
         self.config.active = true;
         self.config.expiry_ts = if duration_mins == 0 {
@@ -151,15 +255,37 @@ impl AppModel {
         } else {
             now_secs() + u64::from(duration_mins) * 60
         };
-        self.save_config();
+        self.apply_inhibits();
+
+        if self.is_inhibiting() {
+            self.save_config();
+        } else {
+            // Nothing was acquired, so do not advertise an active state the
+            // other instances would try and fail to match.
+            self.config = previous;
+            self.apply_inhibits();
+        }
     }
 
     /// Turn Vigil off in response to a user action or expiry, and publish that
     /// to the other instances.
     fn deactivate(&mut self) {
-        self.release_inhibit();
+        self.release_all();
         self.config.active = false;
         self.config.expiry_ts = 0;
+        self.save_config();
+    }
+
+    /// Change one of the behaviour toggles, re-deriving what is held.
+    fn set_allow_screen_off(&mut self, value: bool) {
+        self.config.allow_screen_off = value;
+        self.apply_inhibits();
+        self.save_config();
+    }
+
+    fn set_awake_with_lid_closed(&mut self, value: bool) {
+        self.config.awake_with_lid_closed = value;
+        self.apply_inhibits();
         self.save_config();
     }
 
@@ -281,8 +407,10 @@ impl cosmic::Application for AppModel {
             config,
             config_handler,
             popup: None,
-            inhibit_conn: None,
-            inhibit_cookie: None,
+            screensaver_conn: None,
+            screensaver_cookie: None,
+            logind_fd: None,
+            logind_what: None,
         };
 
         // Adopt whatever state is already shared. This covers an instance
@@ -292,7 +420,7 @@ impl cosmic::Application for AppModel {
             if app.config.expiry_ts != 0 && now_secs() >= app.config.expiry_ts {
                 app.deactivate();
             } else {
-                app.sync_inhibit();
+                app.apply_inhibits();
             }
         }
 
@@ -450,10 +578,25 @@ impl cosmic::Application for AppModel {
             .spacing(6)
             .align_y(Alignment::Center);
 
+        // Behaviour toggles. Both default off, so Vigil behaves exactly as
+        // before until one is turned on.
+        let allow_screen_off = widget::toggler(self.config.allow_screen_off)
+            .label(fl!("allow-screen-off"))
+            .on_toggle(Message::SetAllowScreenOff)
+            .width(Length::Fill);
+
+        let awake_with_lid_closed = widget::toggler(self.config.awake_with_lid_closed)
+            .label(fl!("awake-with-lid-closed"))
+            .on_toggle(Message::SetAwakeWithLidClosed)
+            .width(Length::Fill);
+
         let content = widget::column()
             .push(status_block)
             .push(widget::text::heading(fl!("duration")))
             .push(duration_row)
+            .push(widget::divider::horizontal::default())
+            .push(allow_screen_off)
+            .push(awake_with_lid_closed)
             .spacing(12)
             .align_x(Alignment::Center)
             .padding(12);
@@ -511,7 +654,13 @@ impl cosmic::Application for AppModel {
             }
             Message::UpdateConfig(config) => {
                 self.config = config;
-                self.sync_inhibit();
+                self.apply_inhibits();
+            }
+            Message::SetAllowScreenOff(value) => {
+                self.set_allow_screen_off(value);
+            }
+            Message::SetAwakeWithLidClosed(value) => {
+                self.set_awake_with_lid_closed(value);
             }
             Message::TogglePopup => {
                 return if let Some(p) = self.popup.take() {

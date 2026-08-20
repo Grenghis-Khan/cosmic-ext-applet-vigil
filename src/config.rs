@@ -20,6 +20,20 @@ pub struct Config {
     /// than a remaining count so instances stay in agreement without writing
     /// config once per second.
     pub expiry_ts: u64,
+    /// Let the display sleep normally while keeping the system awake.
+    ///
+    /// `cosmic-idle` treats a ScreenSaver inhibit as "no screen off *and* no
+    /// suspend", so it cannot express this. When set, Vigil takes a logind
+    /// `sleep` block instead, which stops suspend while leaving the configured
+    /// screen-off timeout alone. Intended for leaving a machine reachable over
+    /// SSH or RDP without burning the display.
+    pub allow_screen_off: bool,
+    /// Keep the system awake when the laptop lid is closed.
+    ///
+    /// Adds `handle-lid-switch` to the logind inhibit. Independent of
+    /// `allow_screen_off`, since wanting the lid to be safe to close does not
+    /// imply wanting the screen to sleep.
+    pub awake_with_lid_closed: bool,
 }
 
 impl Default for Config {
@@ -28,6 +42,8 @@ impl Default for Config {
             duration_mins: 30,
             active: false,
             expiry_ts: 0,
+            allow_screen_off: false,
+            awake_with_lid_closed: false,
         }
     }
 }

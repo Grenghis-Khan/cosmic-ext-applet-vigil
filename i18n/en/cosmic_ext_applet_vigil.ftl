@@ -5,3 +5,5 @@ activate = Activate
 deactivate = Deactivate
 duration = Duration
 indefinite = Indefinite
+allow-screen-off = Allow screen to sleep
+awake-with-lid-closed = Stay awake with lid closed
