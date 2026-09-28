@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
 use crate::fl;
+use crate::idle_hook::{self, SuspendHook};
 use cosmic::Theme;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::futures::SinkExt;
@@ -35,6 +36,9 @@ pub struct AppModel {
     /// taken with so a changed setting can re-acquire.
     logind_fd: Option<zbus::zvariant::OwnedFd>,
     logind_what: Option<String>,
+    /// Whether cosmic-idle's suspend will respect the logind `sleep` block.
+    /// Refreshed when the setting changes and when the popup opens.
+    suspend_hook: Option<SuspendHook>,
 }
 
 impl Drop for AppModel {
@@ -57,6 +61,7 @@ pub enum Message {
     UpdateConfig(Config),
     SetAllowScreenOff(bool),
     SetAwakeWithLidClosed(bool),
+    RemoveSuspendHook,
 }
 
 impl AppModel {
@@ -250,6 +255,7 @@ impl AppModel {
 
         self.config.duration_mins = duration_mins;
         self.config.active = true;
+        self.config.activated_ts = now_secs();
         self.config.expiry_ts = if duration_mins == 0 {
             0
         } else {
@@ -270,17 +276,65 @@ impl AppModel {
     /// Turn Vigil off in response to a user action or expiry, and publish that
     /// to the other instances.
     fn deactivate(&mut self) {
+        let held_sleep = self
+            .logind_what
+            .as_deref()
+            .is_some_and(|what| what.split(':').any(|w| w == "sleep"));
+        // Measured from activation, not from when this instance took its
+        // block, so it can only overstate the hold: at worst a suspend comes
+        // later, never not at all.
+        let held_for = Duration::from_secs(now_secs().saturating_sub(self.config.activated_ts));
+
         self.release_all();
         self.config.active = false;
         self.config.expiry_ts = 0;
+        self.config.activated_ts = 0;
         self.save_config();
+
+        // cosmic-idle tries each idle suspend once. If it was refused while
+        // the block was held and nobody is at the machine, nothing would try
+        // again until someone touched it; restart its countdown instead.
+        if held_sleep {
+            idle_hook::restart_suspend_countdown(held_for);
+        }
     }
 
     /// Change one of the behaviour toggles, re-deriving what is held.
     fn set_allow_screen_off(&mut self, value: bool) {
         self.config.allow_screen_off = value;
+        if value {
+            self.ensure_suspend_hook();
+        }
         self.apply_inhibits();
         self.save_config();
+    }
+
+    /// Make sure cosmic-idle's suspend will respect the `sleep` block,
+    /// installing Vigil's `Suspend` command if the user has none. Updates
+    /// config in memory only; the caller saves.
+    fn ensure_suspend_hook(&mut self) {
+        let mut hook = idle_hook::status(self.config.suspend_hook_installed_at);
+        if hook == SuspendHook::Missing {
+            match idle_hook::install() {
+                Ok(at) => {
+                    self.config.suspend_hook_installed_at = at;
+                    hook = idle_hook::status(at);
+                }
+                Err(e) => eprintln!("failed to install the Suspend command: {e}"),
+            }
+        }
+        self.suspend_hook = Some(hook);
+    }
+
+    fn remove_suspend_hook(&mut self) {
+        match idle_hook::remove(self.config.suspend_hook_installed_at) {
+            Ok(_) => {
+                self.config.suspend_hook_installed_at = 0;
+                self.save_config();
+            }
+            Err(e) => eprintln!("failed to remove the Suspend command: {e}"),
+        }
+        self.suspend_hook = Some(idle_hook::status(self.config.suspend_hook_installed_at));
     }
 
     fn set_awake_with_lid_closed(&mut self, value: bool) {
@@ -411,7 +465,18 @@ impl cosmic::Application for AppModel {
             screensaver_cookie: None,
             logind_fd: None,
             logind_what: None,
+            suspend_hook: None,
         };
+
+        // Covers an upgrade from a version without the hook, with the setting
+        // already on.
+        if app.config.allow_screen_off {
+            let installed_at = app.config.suspend_hook_installed_at;
+            app.ensure_suspend_hook();
+            if app.config.suspend_hook_installed_at != installed_at {
+                app.save_config();
+            }
+        }
 
         // Adopt whatever state is already shared. This covers an instance
         // starting late (a monitor plugged in while Vigil is on) and
@@ -590,13 +655,35 @@ impl cosmic::Application for AppModel {
             .on_toggle(Message::SetAwakeWithLidClosed)
             .width(Length::Fill);
 
+        // Only shown when "allow screen to sleep" cannot do what it says, or
+        // when there is something of Vigil's left to take out.
+        let hook_note = match self.suspend_hook {
+            Some(hook) if self.config.allow_screen_off && !hook.holds() => Some(
+                widget::text::caption(match hook {
+                    SuspendHook::PendingLogin => fl!("suspend-hook-pending"),
+                    SuspendHook::Custom => fl!("suspend-hook-custom"),
+                    _ => fl!("suspend-hook-unavailable"),
+                })
+                .width(Length::Fill),
+            ),
+            _ => None,
+        };
+        let hook_remove = (!self.config.allow_screen_off
+            && self.config.suspend_hook_installed_at != 0)
+            .then(|| {
+                widget::button::standard(fl!("suspend-hook-remove"))
+                    .on_press(Message::RemoveSuspendHook)
+            });
+
         let content = widget::column()
             .push(status_block)
             .push(widget::text::heading(fl!("duration")))
             .push(duration_row)
             .push(widget::divider::horizontal::default())
             .push(allow_screen_off)
+            .push_maybe(hook_note)
             .push(awake_with_lid_closed)
+            .push_maybe(hook_remove)
             .spacing(12)
             .align_x(Alignment::Center)
             .padding(12);
@@ -662,10 +749,17 @@ impl cosmic::Application for AppModel {
             Message::SetAwakeWithLidClosed(value) => {
                 self.set_awake_with_lid_closed(value);
             }
+            Message::RemoveSuspendHook => {
+                self.remove_suspend_hook();
+            }
             Message::TogglePopup => {
                 return if let Some(p) = self.popup.take() {
                     destroy_popup(p)
                 } else {
+                    // Another instance may have changed the hook, and a login
+                    // since may have made it take effect.
+                    self.suspend_hook =
+                        Some(idle_hook::status(self.config.suspend_hook_installed_at));
                     let new_id = Id::unique();
                     self.popup.replace(new_id);
                     let mut popup_settings = self.core.applet.get_popup_settings(

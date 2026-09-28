@@ -7,3 +7,7 @@ duration = Duration
 indefinite = Indefinite
 allow-screen-off = Allow screen to sleep
 awake-with-lid-closed = Stay awake with lid closed
+suspend-hook-pending = Takes effect after your next login. Until then the system can still suspend when idle.
+suspend-hook-custom = You have your own Suspend command, so the system can still suspend when idle.
+suspend-hook-unavailable = Could not update the Suspend command, so the system can still suspend when idle.
+suspend-hook-remove = Remove Vigil's Suspend command

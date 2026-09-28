@@ -873,7 +873,9 @@ dependencies = [
  "i18n-embed",
  "i18n-embed-fl",
  "libcosmic",
+ "ron",
  "rust-embed",
+ "serde",
  "tokio",
  "zbus",
 ]

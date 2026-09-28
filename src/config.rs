@@ -20,6 +20,13 @@ pub struct Config {
     /// than a remaining count so instances stay in agreement without writing
     /// config once per second.
     pub expiry_ts: u64,
+    /// Unix timestamp, in seconds, at which Vigil was last turned on.
+    ///
+    /// Shared so that an instance `cosmic-panel` respawned mid-session still
+    /// knows how long the block has been wanted. Zero when unknown, which is
+    /// read as "long enough ago" so the suspend countdown is restarted rather
+    /// than left refused.
+    pub activated_ts: u64,
     /// Let the display sleep normally while keeping the system awake.
     ///
     /// `cosmic-idle` treats a ScreenSaver inhibit as "no screen off *and* no
@@ -34,6 +41,12 @@ pub struct Config {
     /// `allow_screen_off`, since wanting the lid to be safe to close does not
     /// imply wanting the screen to sleep.
     pub awake_with_lid_closed: bool,
+    /// Unix timestamp, in seconds, at which Vigil added its `Suspend` command
+    /// to cosmic-settings' system actions; zero if Vigil has not added one.
+    ///
+    /// Recorded so that only an override Vigil wrote is ever removed, and so
+    /// the popup can tell whether `cosmic-idle` has loaded it yet.
+    pub suspend_hook_installed_at: u64,
 }
 
 impl Default for Config {
@@ -42,8 +55,10 @@ impl Default for Config {
             duration_mins: 30,
             active: false,
             expiry_ts: 0,
+            activated_ts: 0,
             allow_screen_off: false,
             awake_with_lid_closed: false,
+            suspend_hook_installed_at: 0,
         }
     }
 }

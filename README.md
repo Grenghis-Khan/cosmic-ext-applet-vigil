@@ -23,6 +23,42 @@ Then add the applet to a panel in **Settings > Desktop > Panel**.
 
 NixOS users should use `just install-user` to install to `~/.local`.
 
+## Allow screen to sleep
+
+With this on, Vigil keeps the system from suspending but lets the screen turn
+off on its usual timeout, for leaving a machine reachable over SSH or remote
+desktop. It holds a logind `sleep` block instead of a screensaver inhibit.
+
+On systemd older than 257 (Pop!_OS 24.04 included), logind ignores a block
+held by the same user who asks to suspend, and COSMIC's idle daemon suspends
+as you with a plain `systemctl suspend`. So the first time you turn the
+setting on, Vigil adds one entry to your shortcuts config,
+`~/.config/cosmic/com.system76.CosmicSettings.Shortcuts/v1/system_actions`:
+
+```ron
+Suspend: "systemctl suspend --check-inhibitors=yes",
+```
+
+That makes the idle suspend check every block, including your own. It takes
+effect at your next login; until then the popup says so. If you already have
+your own `Suspend` command, Vigil leaves it alone and warns you instead. On
+systemd 257 and later nothing is added, because logind refuses by itself.
+
+The effect lasts only as long as Vigil holds the block, which logind releases
+when the process exits for any reason, so the machine goes back to suspending
+on its normal schedule once Vigil is off or gone. The idle daemon does not
+retry a suspend it was refused, so when Vigil lets go after holding the block
+for at least the suspend timeout, it restarts the daemon's countdown and the
+machine suspends that long afterwards. After a shorter session no attempt was
+refused, and the countdown already running is left alone.
+
+The entry is harmless when no block is held. To take it out, turn the setting
+off and press **Remove Vigil's Suspend command** in the popup;
+`just uninstall-user` and `just uninstall` do it for you. A Flatpak uninstall
+cannot run anything, so there, remove the `Suspend:` line from that file by
+hand, or run `cosmic-ext-applet-vigil --remove-suspend-override` before
+uninstalling.
+
 ## Translators
 
 [Fluent][fluent] is used for localization of the software. Fluent's translation files are found in the [i18n directory](./i18n). New translations may copy the [English (en) localization](./i18n/en) of the project, rename `en` to the desired [ISO 639-1 language code][iso-codes], and then translations can be provided for each [message identifier][fluent-guide]. If no translation is necessary, the message may be omitted.

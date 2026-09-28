@@ -83,12 +83,15 @@ dev-install: (build-release)
 dev-reload: (build-release)
     pkill cosmic-panel || true
 
-# Uninstalls files
+# Uninstalls files. Under sudo, first takes Vigil's Suspend command back out
+# of the invoking user's shortcuts config; other accounts keep theirs.
 uninstall:
+    -if [ -n "${SUDO_USER:-}" ]; then sudo -u "$SUDO_USER" -H {{bin-dst}} --remove-suspend-override; else {{bin-dst}} --remove-suspend-override; fi
     rm {{bin-dst}} {{desktop-dst}} {{icon-dst}}
 
-# Uninstalls user-local files
+# Uninstalls user-local files, first taking Vigil's Suspend command back out
 uninstall-user:
+    -{{user-bin-dst}} --remove-suspend-override
     rm -f {{user-bin-dst}} {{user-desktop-dst}} {{user-metainfo-dst}} {{user-icon-dst}}
 
 # Vendor dependencies locally
